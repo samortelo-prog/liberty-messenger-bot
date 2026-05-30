@@ -1,0 +1,15 @@
+{
+  "name": "liberty-messenger-bot",
+  "version": "1.0.0",
+  "description": "Liberty Media Messenger Bot con GPT-4o",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
