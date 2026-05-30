@@ -105,17 +105,22 @@ function updateChecklist(psid, userMsg, botReply) {
     { c.logo = true; c.logoValor = val; }
 
   const dias = ['lunes','martes','miércoles','miercoles','jueves','viernes',
-    'sábado','sabado','domingo','mañana','tarde','noche','cualquier','disponible','semana','am','pm'];
+    'sábado','sabado','domingo','mañana','tarde','noche','cualquier',
+    'disponible','semana','am','pm',':00',':30','hoy','mañana'];
   if (!c.disponibilidad && dias.some(d => u.includes(d)))
     { c.disponibilidad = true; c.disponibilidadValor = val; }
-  if (!c.disponibilidad && (b.includes('horarios') || b.includes('días y horarios')) && val.length > 2)
+  // Si Samuel preguntó disponibilidad y el cliente respondió cualquier cosa
+  if (!c.disponibilidad && (b.includes('horarios') || b.includes('días y horarios') ||
+    b.includes('mejor momento') || b.includes('te viene mejor')) && val.length > 1)
     { c.disponibilidad = true; c.disponibilidadValor = val; }
 
   // Número — en Messenger preguntamos explícitamente el teléfono
-  const phoneMatch = userMsg.match(/9\d{8}/);
+  const phoneMatch = userMsg.match(/\d{7,9}/);
   if (!c.numero && phoneMatch)
     { c.numero = true; c.numeroValor = phoneMatch[0]; }
-  else if (!c.numero && b.includes('número') && val.length > 3)
+  // Si Samuel preguntó el número y el cliente respondió algo con dígitos o texto
+  if (!c.numero && (b.includes('número') || b.includes('whatsapp') ||
+    b.includes('teléfono') || b.includes('telefono') || b.includes('llamamos')) && val.length > 2)
     { c.numero = true; c.numeroValor = val; }
 
   if (!c.nombre && (b.includes('cómo te llamas') || b.includes('como te llamas')) && val.length > 1)
@@ -280,19 +285,29 @@ async function processMessage(psid, userText) {
 
   scheduleFollowup(psid);
 
-  // Verificar cierre
+  // Verificar cierre — basado en checklist, no en frases del modelo
   const c = getChecklist(psid);
   const rl = reply.toLowerCase();
   const checklistOk = c.negocio && c.objetivo && c.disponibilidad && c.numero;
-  const isClosing =
-    rl.includes('asesor te llamar') ||
-    rl.includes('asesor te contactar') ||
-    (rl.includes('ya tengo todo') && rl.includes('asesor')) ||
-    rl.includes('en el horario que indicaste') ||
-    rl.includes('disponibilidad esta semana');
 
-  if (checklistOk && isClosing) {
-    console.log('Cierre detectado — notificando...');
+  // Notificar cuando checklist completo Y Samuel está cerrando o ya cerró
+  const samuelCerro =
+    rl.includes('asesor') ||
+    rl.includes('llamar') ||
+    rl.includes('ya tengo') ||
+    rl.includes('hablamos') ||
+    rl.includes('coordinar') ||
+    rl.includes('disponibilidad') ||
+    rl.includes('perfecto') && rl.includes('todo');
+
+  if (checklistOk && samuelCerro) {
+    console.log('\n===== CIERRE DETECTADO =====');
+    console.log('PSID: ' + psid);
+    console.log('Negocio: ' + c.negocioValor);
+    console.log('Disponibilidad: ' + c.disponibilidadValor);
+    console.log('Numero: ' + c.numeroValor);
+    console.log('============================\n');
+
     if (followupTimers.has(psid)) {
       clearTimeout(followupTimers.get(psid));
       followupTimers.delete(psid);
@@ -302,6 +317,10 @@ async function processMessage(psid, userText) {
     conversations.delete(psid);
     clientChecklist.delete(psid);
     firstMessage.delete(psid);
+  } else if (checklistOk) {
+    // Checklist completo pero Samuel aún no cerró — forzar notificación en el próximo mensaje
+    console.log('Checklist completo, esperando cierre de Samuel...');
+    console.log('neg=' + c.negocio + ' obj=' + c.objetivo + ' disp=' + c.disponibilidad + ' num=' + c.numero);
   }
 }
 
