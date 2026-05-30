@@ -13,6 +13,7 @@ const clientChecklist = new Map();
 const firstMessage    = new Set();
 const followupTimers  = new Map();
 const pausedChats     = new Set();
+const completedChats  = new Set();
 
 const FOLLOWUP_DELAY  = 24 * 60 * 60 * 1000;
 
@@ -57,8 +58,9 @@ FLUJO — máximo 6 preguntas:
 
 6. NOMBRE: "¿Y cómo te llamas?"
 
-7. CIERRE:
-"Perfecto [nombre], ya tengo todo. El asesor te llamará [horario] para coordinar los detalles de la web de [negocio]. Tenemos disponibilidad esta semana."
+7. CIERRE — solo cuando tengas negocio, objetivo, disponibilidad y número:
+"Perfecto [nombre], ya tengo toda la información que necesito. En breve nuestro equipo se pondrá en contacto contigo para coordinar los detalles de tu web."
+NO menciones horarios ni confirmes la llamada — eso lo hace el asesor manualmente.
 
 REGLAS:
 - Una pregunta por mensaje
@@ -259,6 +261,16 @@ function scheduleFollowup(psid) {
 async function processMessage(psid, userText) {
   if (pausedChats.has(psid)) return;
 
+  // Si el cliente escribe después de completar el flujo
+  if (completedChats.has(psid)) {
+    if (!completedChats.has(psid + '_replied')) {
+      completedChats.add(psid + '_replied');
+      await new Promise(r => setTimeout(r, 3000));
+      await sendMessage(psid, 'Con gusto. Nuestro equipo estará en contacto contigo pronto.');
+    }
+    return;
+  }
+
   console.log('Mensaje de ' + psid + ': ' + userText.substring(0, 80));
 
   // Simular que está escribiendo
@@ -314,6 +326,7 @@ async function processMessage(psid, userText) {
     }
     const conv = conversations.get(psid) || [];
     await notifyOwner(psid, conv);
+    completedChats.add(psid);
     conversations.delete(psid);
     clientChecklist.delete(psid);
     firstMessage.delete(psid);
