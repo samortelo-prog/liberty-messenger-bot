@@ -2,11 +2,14 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-const VERIFY_TOKEN     = process.env.VERIFY_TOKEN; // tú lo defines, cualquier texto
-const OWNER_PSID       = process.env.OWNER_PSID;   // tu PSID de Facebook (te lo doy abajo)
-const PORT             = process.env.PORT || 3000;
+const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
+const OWNER_PSID        = process.env.OWNER_PSID;
+const PORT              = process.env.PORT || 3000;
+
+const BUFFER_WAIT    = 7000;  // espera 7s de silencio antes de responder
+const FOLLOWUP_DELAY = 24 * 60 * 60 * 1000;
 
 const conversations   = new Map();
 const clientChecklist = new Map();
@@ -14,14 +17,15 @@ const firstMessage    = new Set();
 const followupTimers  = new Map();
 const pausedChats     = new Set();
 const completedChats  = new Set();
+const messageBuffer   = new Map();   // buffer de mensajes agrupados
+const processedMsgIds = new Set();   // IDs de mensajes ya procesados (anti-duplicado)
+const processingNow   = new Set();   // PSIDs que están siendo procesados ahora mismo
 
-const FOLLOWUP_DELAY  = 24 * 60 * 60 * 1000;
-
-// ── SYSTEM PROMPT (mismo que WhatsApp) ──
+// ── SYSTEM PROMPT ──
 const SYSTEM_PROMPT = `Eres Samuel, asesor de Liberty Media, una agencia digital peruana que crea páginas web profesionales.
 
 ROL:
-El cliente viene de un anuncio de Facebook — ya mostró interés. Tu trabajo es generar confianza rápido, recolectar los datos clave y agendar la llamada con el asesor. Este chat es por Messenger — el cliente NO tiene número de teléfono visible, por eso debes pedírselo explícitamente.
+El cliente viene de un anuncio de Facebook — ya mostró interés. Tu trabajo es generar confianza rápido, recolectar los datos clave y agendar la llamada. Este chat es por Messenger — el cliente NO tiene número de teléfono visible, por eso debes pedírselo explícitamente.
 
 PERSONALIDAD:
 - Cálido, cercano y profesional
@@ -29,7 +33,8 @@ PERSONALIDAD:
 - Máximo 2 oraciones por mensaje — breve y directo
 - Texto plano sin asteriscos ni markdown
 - Un solo emoji cuando sea natural
-- MUY IMPORTANTE: Si el cliente ya dio información, úsala — NUNCA repitas una pregunta que ya respondió
+- CRÍTICO: Lee TODO el historial antes de responder. NUNCA repitas una pregunta que el cliente ya respondió.
+- CRÍTICO: Haz UNA sola pregunta por mensaje. Si el cliente manda varios mensajes juntos, respóndelos todos en UN solo mensaje.
 - Usa el nombre del cliente cuando lo tengas
 
 EL SERVICIO:
@@ -37,7 +42,7 @@ EL SERVICIO:
 - Diseño personalizado, responsive, hosting primer año gratis, SSL, textos e imágenes incluidos
 - Entrega en 3 a 7 días hábiles
 
-TRABAJOS RECIENTES (mostrar en paso 3 siempre):
+TRABAJOS RECIENTES:
 - https://vitain.pe/
 - https://sanguchoncampesino.pe/
 - https://lisoft.edu.pe/
@@ -46,46 +51,37 @@ PREGUNTAS FRECUENTES:
 - Precio: "El servicio parte desde S/500. El asesor te dará la propuesta exacta."
 - Hosting: "El hosting del primer año está incluido gratis, con SSL y servidor rápido."
 - Tiempo: "Entre 3 y 7 días hábiles desde que aprobamos el proyecto."
+- "¿Me pueden llamar ahora?": "Claro, coordinaremos para llamarte lo antes posible. Solo necesito unos datos más."
 - Dominio o mantenimiento: "El asesor te explicará cuando te llame."
 
-FLUJO — en este orden exacto:
+FLUJO — sigue este orden, UNA pregunta a la vez:
 
-1. BIENVENIDA — mensaje corto, máximo 2 líneas:
-"Hola, soy Samuel de Liberty Media. ¿A qué se dedica tu negocio?"
-Nada más. Simple y directo. No expliques todo en el primer mensaje.
+1. BIENVENIDA (corto): "Hola, soy Samuel de Liberty Media. ¿A qué se dedica tu negocio?"
 
-2. NOMBRE DEL NEGOCIO: Si el cliente solo dijo el rubro pero no el nombre, pregunta:
-"¿Y cuál es el nombre de tu negocio?"
-Si ya dio ambos, pasa directo al objetivo.
+2. NOMBRE DEL NEGOCIO: Si solo dijo el rubro, pregunta "¿Y cuál es el nombre de tu negocio?" Si ya dio ambos, salta al objetivo.
 
-3. OBJETIVO: "¿Qué necesitas que haga tu web? Por ejemplo: mostrar tus propiedades, recibir consultas, o que los clientes te contacten."
-Adapta el ejemplo al rubro del cliente.
+3. OBJETIVO: "¿Qué necesitas que haga tu web? Por ejemplo: mostrar tus propiedades, recibir consultas, o que los clientes te contacten." Adapta el ejemplo al rubro.
 
-4. MOSTRAR TRABAJOS + LOGO:
-"Por cierto, aquí algunos trabajos recientes para que veas el nivel: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/ ¿Tienes logo y colores de tu marca?"
+4. TRABAJOS + LOGO: "Por cierto, aquí algunos trabajos recientes para que veas el nivel: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/ ¿Tienes logo y colores de tu marca?"
 
 5. DISPONIBILIDAD: "¿Qué días y horarios te vienen mejor para que te llamemos?"
 
-6. NÚMERO DE TELÉFONO — CRÍTICO en Messenger:
-"¿A qué número de WhatsApp o teléfono te llamamos?"
-NUNCA preguntes "este mismo número" — en Messenger no hay número automático.
-SIEMPRE pide el número explícitamente con dígitos.
-Si el cliente dice "este número" o "el mismo", responde:
-"Para poder llamarte necesito el número. ¿Cuál es tu WhatsApp o teléfono?"
+6. NÚMERO (CRÍTICO en Messenger): "¿A qué número de WhatsApp o teléfono te llamamos?"
+SIEMPRE pide dígitos reales. Si dice "este número" o "el mismo", responde: "Para poder llamarte necesito el número. ¿Cuál es tu WhatsApp o teléfono?"
 
 7. NOMBRE: "¿Y cómo te llamas?"
 
-8. CIERRE — solo cuando tengas negocio, objetivo, disponibilidad y número con dígitos reales:
+8. CIERRE — solo cuando tengas negocio, objetivo, disponibilidad y número con dígitos:
 "Perfecto [nombre], ya tengo todo. En las próximas horas nuestro equipo te contactará para coordinar los detalles de la web de [negocio]."
 
 REGLAS CRÍTICAS:
-- NUNCA repitas una pregunta que el cliente ya respondió — lee el historial
-- NUNCA uses "este mismo número" — siempre pide el número con dígitos
-- NUNCA cierres sin tener un número de teléfono real con dígitos
-- Una pregunta por mensaje
+- NUNCA repitas una pregunta ya respondida — lee el historial completo
+- Si el cliente manda 2 o 3 mensajes seguidos, respóndelos en UN solo mensaje, no varios
+- NUNCA uses "este mismo número" — siempre pide dígitos
+- NUNCA cierres sin número de teléfono real con dígitos
 - NUNCA menciones pagos ni adelantos
 - Si manda sticker: ignóralo y continúa
-- Nunca menciones inteligencia artificial`
+- Nunca menciones inteligencia artificial`;
 
 // ── CHECKLIST ──
 function getChecklist(psid) {
@@ -108,58 +104,73 @@ function isReadyToClose(psid) {
   return c.negocio && c.objetivo && c.disponibilidad && c.numero;
 }
 
-// ── ACTUALIZAR CHECKLIST ──
-function updateChecklist(psid, userMsg, botReply) {
+// ── ACTUALIZAR CHECKLIST (usa la pregunta anterior del bot) ──
+function updateChecklist(psid, userMsg) {
   const c = getChecklist(psid);
   const u = userMsg.toLowerCase();
-  const b = (botReply || '').toLowerCase();
   const val = userMsg.trim();
 
-  // Capturar negocio cuando Samuel preguntó por él y el cliente respondió algo
-  if (!c.negocio && (b.includes('dedica') || b.includes('nombre de tu negocio') ||
-    b.includes('a qué se dedica') || b.includes('cuál es el nombre')) && val.length > 1)
+  // El último mensaje del bot en el historial es la pregunta que el cliente acaba de responder
+  const history = conversations.get(psid) || [];
+  const botMsgs = history.filter(m => m.role === 'assistant');
+  const lastBotMsg = botMsgs.length > 0 ? botMsgs[botMsgs.length - 1].content.toLowerCase() : '';
+
+  // NEGOCIO
+  if (!c.negocio && (
+    lastBotMsg.includes('dedica') || lastBotMsg.includes('nombre de tu negocio') ||
+    lastBotMsg.includes('cuál es el nombre') || botMsgs.length <= 1
+  ) && val.length > 1)
     { c.negocio = true; c.negocioValor = val; }
-  // También capturar si el cliente da su rubro directamente sin que Samuel lo pida
-  if (!c.negocio && val.length > 2 && conversations.has(psid) &&
-    conversations.get(psid).length <= 2)
-    { c.negocio = true; c.negocioValor = val; }
-  if (!c.objetivo && (b.includes('necesitas que haga') || b.includes('objetivo') || b.includes('mostrar')) && val.length > 2)
+
+  // OBJETIVO
+  if (!c.objetivo && (
+    lastBotMsg.includes('necesitas que haga') || lastBotMsg.includes('qué necesitas') ||
+    lastBotMsg.includes('mostrar tus') || lastBotMsg.includes('recibir consultas')
+  ) && val.length > 2)
     { c.objetivo = true; c.objetivoValor = val; }
-  if (!c.logo && (b.includes('logo') || b.includes('colores')) && val.length > 1)
+
+  // LOGO
+  if (!c.logo && (lastBotMsg.includes('logo') || lastBotMsg.includes('colores de tu marca')) && val.length > 1)
     { c.logo = true; c.logoValor = val; }
 
+  // DISPONIBILIDAD
   const dias = ['lunes','martes','miércoles','miercoles','jueves','viernes',
-    'sábado','sabado','domingo','mañana','tarde','noche','cualquier',
-    'disponible','semana','am','pm',':00',':30','hoy','mañana'];
-  if (!c.disponibilidad && dias.some(d => u.includes(d)))
-    { c.disponibilidad = true; c.disponibilidadValor = val; }
-  // Si Samuel preguntó disponibilidad y el cliente respondió cualquier cosa
-  if (!c.disponibilidad && (b.includes('horarios') || b.includes('días y horarios') ||
-    b.includes('mejor momento') || b.includes('te viene mejor')) && val.length > 1)
+    'sábado','sabado','domingo','mañana','tarde','noche','hoy',
+    'am','pm',':00',':30','cualquier','disponible'];
+  if (!c.disponibilidad && (
+    dias.some(d => u.includes(d)) ||
+    lastBotMsg.includes('días y horarios') || lastBotMsg.includes('te vienen mejor') ||
+    lastBotMsg.includes('mejor momento') || lastBotMsg.includes('agendamos')
+  ) && val.length > 1)
     { c.disponibilidad = true; c.disponibilidadValor = val; }
 
-  // Número — en Messenger SIEMPRE requiere dígitos reales
-  const phoneMatch = userMsg.match(/\d{6,12}/);
-  if (!c.numero && phoneMatch && phoneMatch[0].length >= 6) {
-    c.numero = true; c.numeroValor = phoneMatch[0];
-  }
-  // Si el cliente dice "este número" o "el mismo" — NO marcar como capturado
-  // Samuel debe pedir el número explícitamente con dígitos
-  const sinDigitos = !phoneMatch && (
-    u.includes('este número') || u.includes('este numero') ||
-    u.includes('el mismo') || u.includes('este whatsapp') ||
-    u.includes('mismo') || u === 'sí' || u === 'si' || u === 'ok'
-  );
-  if (sinDigitos) {
-    // No marcar numero — dejar que Samuel pida los dígitos reales
-    console.log('Número sin dígitos detectado — Samuel pedirá el número explícito');
+  // NÚMERO — solo dígitos reales
+  const phoneMatch = userMsg.match(/9\d{8}/);
+  const anyDigits = userMsg.match(/\d{6,}/);
+  if (!c.numero && (phoneMatch || (anyDigits && (
+    lastBotMsg.includes('número') || lastBotMsg.includes('whatsapp') ||
+    lastBotMsg.includes('teléfono') || lastBotMsg.includes('llamamos')
+  )))) {
+    c.numero = true;
+    c.numeroValor = phoneMatch ? phoneMatch[0] : anyDigits[0];
   }
 
-  if (!c.nombre && (b.includes('cómo te llamas') || b.includes('como te llamas')) && val.length > 1)
+  // NOMBRE
+  if (!c.nombre && (
+    lastBotMsg.includes('cómo te llamas') || lastBotMsg.includes('como te llamas') ||
+    lastBotMsg.includes('tu nombre')
+  ) && val.length > 1 && !/\d/.test(val))
     { c.nombre = true; c.nombreValor = val; }
 
-  if (u.includes('urgente') || u.includes('lo antes posible') || u.includes('para el lanzamiento'))
+  // URGENCIA
+  if (u.includes('urgente') || u.includes('lo antes posible') || u.includes('ahora mismo') || u.includes('llamar ahora'))
     { c.urgencia = 'urgente'; }
+
+  console.log('[checklist ' + psid + '] neg=' + c.negocio + '(' + c.negocioValor + ')' +
+    ' obj=' + c.objetivo + '(' + c.objetivoValor + ')' +
+    ' logo=' + c.logo + ' disp=' + c.disponibilidad + '(' + c.disponibilidadValor + ')' +
+    ' num=' + c.numero + '(' + c.numeroValor + ')' +
+    ' nom=' + c.nombre + '(' + c.nombreValor + ')');
 }
 
 // ── LLAMAR A GPT-4o ──
@@ -168,6 +179,10 @@ async function callGPT(psid, userMessage) {
   const history = conversations.get(psid);
 
   history.push({ role: 'user', content: userMessage });
+
+  // Actualizar checklist ANTES de generar respuesta (usa la pregunta anterior del bot)
+  updateChecklist(psid, userMessage);
+
   const trimmedHistory = history.slice(-20);
 
   try {
@@ -183,8 +198,8 @@ async function callGPT(psid, userMessage) {
           { role: 'system', content: SYSTEM_PROMPT },
           ...trimmedHistory
         ],
-        max_tokens: 300,
-        temperature: 0.7
+        max_tokens: 250,
+        temperature: 0.6
       })
     });
 
@@ -195,8 +210,6 @@ async function callGPT(psid, userMessage) {
     if (!botReply) throw new Error('Respuesta vacía');
 
     history.push({ role: 'assistant', content: botReply });
-    updateChecklist(psid, userMessage, botReply);
-
     return botReply;
 
   } catch(err) {
@@ -205,7 +218,7 @@ async function callGPT(psid, userMessage) {
   }
 }
 
-// ── ENVIAR MENSAJE POR MESSENGER ──
+// ── ENVIAR MENSAJE ──
 async function sendMessage(psid, text) {
   try {
     const response = await fetch(
@@ -220,25 +233,30 @@ async function sendMessage(psid, text) {
         })
       }
     );
-    if (!response.ok) {
-      const err = await response.text();
-      console.error('Error enviando mensaje:', err);
-    }
+    if (!response.ok) console.error('Error enviando:', await response.text());
   } catch(err) {
     console.error('Error Messenger API:', err.message);
   }
 }
 
+async function sendTyping(psid) {
+  try {
+    await fetch('https://graph.facebook.com/v19.0/me/messages?access_token=' + PAGE_ACCESS_TOKEN, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recipient: { id: psid }, sender_action: 'typing_on' })
+    });
+  } catch(e) {}
+}
+
 // ── NOTIFICAR AL DUEÑO ──
 async function notifyOwner(psid, conv) {
   if (!OWNER_PSID) return;
-
   const now = new Date().toLocaleString('es-PE', { timeZone: 'America/Lima' });
   const c = clientChecklist.get(psid) || {};
   const na = 'No especificado';
   const urgTag = c.urgencia === 'urgente' ? ' — URGENTE' : '';
 
-  // Resumen IA
   const convText = conv.map(m => (m.role === 'user' ? 'CLIENTE' : 'SAMUEL') + ': ' + m.content).join('\n');
   let resumenIA = '';
   try {
@@ -260,13 +278,13 @@ async function notifyOwner(psid, conv) {
 
   const notification =
     'NUEVO LEAD (Messenger)' + urgTag + '\n\n' +
-    'Nombre: '      + (c.nombreValor        || na) + '\n' +
-    'Negocio: '     + (c.negocioValor        || na) + '\n' +
-    'Objetivo: '    + (c.objetivoValor       || na) + '\n' +
-    'Logo: '        + (c.logoValor           || na) + '\n\n' +
+    'Nombre: '     + (c.nombreValor        || na) + '\n' +
+    'Negocio: '    + (c.negocioValor        || na) + '\n' +
+    'Objetivo: '   + (c.objetivoValor       || na) + '\n' +
+    'Logo: '       + (c.logoValor           || na) + '\n\n' +
     (resumenIA ? resumenIA + '\n\n' : '') +
-    'Llamar al: '   + (c.numeroValor         || 'Ver Messenger') + '\n' +
-    'Disponible: '  + (c.disponibilidadValor || na) + '\n' +
+    'Llamar al: '  + (c.numeroValor         || 'Ver Messenger') + '\n' +
+    'Disponible: ' + (c.disponibilidadValor || na) + '\n' +
     'Facebook: messenger.com/t/' + psid;
 
   await sendMessage(OWNER_PSID, notification);
@@ -277,7 +295,7 @@ async function notifyOwner(psid, conv) {
 function scheduleFollowup(psid) {
   if (followupTimers.has(psid)) clearTimeout(followupTimers.get(psid));
   const timer = setTimeout(async () => {
-    if (pausedChats.has(psid) || isReadyToClose(psid)) return;
+    if (pausedChats.has(psid) || isReadyToClose(psid) || completedChats.has(psid)) return;
     const conv = conversations.get(psid) || [];
     if (conv.length === 0) return;
     console.log('Seguimiento a ' + psid);
@@ -287,92 +305,82 @@ function scheduleFollowup(psid) {
   followupTimers.set(psid, timer);
 }
 
-// ── PROCESAR MENSAJE ENTRANTE ──
-async function processMessage(psid, userText) {
-  if (pausedChats.has(psid)) return;
+// ── PROCESAR BUFFER (mensajes agrupados) ──
+async function processBuffer(psid) {
+  const buf = messageBuffer.get(psid);
+  if (!buf || buf.messages.length === 0) return;
+  messageBuffer.delete(psid);
 
-  // Si el cliente escribe después de completar el flujo
-  if (completedChats.has(psid)) {
-    if (!completedChats.has(psid + '_replied')) {
-      completedChats.add(psid + '_replied');
-      await new Promise(r => setTimeout(r, 3000));
-      await sendMessage(psid, 'Con gusto. Pronto tendrás noticias nuestras.');
+  // Evitar procesamiento concurrente para el mismo cliente
+  if (processingNow.has(psid)) return;
+  processingNow.add(psid);
+
+  try {
+    const combinedText = buf.messages.join('. ');
+    console.log('\nMensaje de ' + psid + ': ' + combinedText.substring(0, 100));
+
+    // Post-cierre: responder una vez y silencio
+    if (completedChats.has(psid)) {
+      if (!completedChats.has(psid + '_replied')) {
+        completedChats.add(psid + '_replied');
+        await new Promise(r => setTimeout(r, 2500));
+        await sendMessage(psid, 'Con gusto. Pronto tendrás noticias nuestras.');
+      }
+      return;
     }
-    return;
-  }
 
-  console.log('Mensaje de ' + psid + ': ' + userText.substring(0, 80));
+    await sendTyping(psid);
 
-  // Simular que está escribiendo
-  await fetch('https://graph.facebook.com/v19.0/me/messages?access_token=' + PAGE_ACCESS_TOKEN, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      recipient: { id: psid },
-      sender_action: 'typing_on'
-    })
-  }).catch(() => {});
+    const isFirst = !firstMessage.has(psid);
+    if (isFirst) firstMessage.add(psid);
+    const thinkTime = isFirst ? 3000 : Math.min(7000 + combinedText.length * 12, 11000);
+    await new Promise(r => setTimeout(r, thinkTime));
 
-  // Tiempo de espera natural
-  const isFirst = !firstMessage.has(psid);
-  if (isFirst) firstMessage.add(psid);
-  const thinkTime = isFirst ? 3000 : Math.min(8000 + userText.length * 15, 12000);
-  await new Promise(r => setTimeout(r, thinkTime));
+    const reply = await callGPT(psid, combinedText);
+    if (!reply) return;
 
-  const reply = await callGPT(psid, userText);
-  if (!reply) return;
+    await sendMessage(psid, reply);
+    console.log('Samuel: ' + reply.substring(0, 100));
 
-  await sendMessage(psid, reply);
-  console.log('Samuel: ' + reply.substring(0, 100));
+    scheduleFollowup(psid);
 
-  scheduleFollowup(psid);
+    // Verificar cierre
+    const c = getChecklist(psid);
+    const rl = reply.toLowerCase();
+    const checklistOk = c.negocio && c.objetivo && c.disponibilidad && c.numero;
+    const samuelCerro =
+      rl.includes('ya tengo todo') ||
+      rl.includes('nuestro equipo te contactar') ||
+      rl.includes('en las próximas horas') ||
+      (rl.includes('perfecto') && rl.includes('coordinar'));
 
-  // Verificar cierre — basado en checklist, no en frases del modelo
-  const c = getChecklist(psid);
-  const rl = reply.toLowerCase();
-  const checklistOk = c.negocio && c.objetivo && c.disponibilidad && c.numero;
-
-  // Notificar cuando checklist completo Y Samuel está cerrando o ya cerró
-  const samuelCerro =
-    rl.includes('asesor') ||
-    rl.includes('llamar') ||
-    rl.includes('ya tengo') ||
-    rl.includes('hablamos') ||
-    rl.includes('coordinar') ||
-    rl.includes('disponibilidad') ||
-    rl.includes('perfecto') && rl.includes('todo');
-
-  if (checklistOk && samuelCerro) {
-    console.log('\n===== CIERRE DETECTADO =====');
-    console.log('PSID: ' + psid);
-    console.log('Negocio: ' + c.negocioValor);
-    console.log('Disponibilidad: ' + c.disponibilidadValor);
-    console.log('Numero: ' + c.numeroValor);
-    console.log('============================\n');
-
-    if (followupTimers.has(psid)) {
-      clearTimeout(followupTimers.get(psid));
-      followupTimers.delete(psid);
+    if (checklistOk && samuelCerro) {
+      console.log('\n===== CIERRE DETECTADO =====');
+      console.log('Negocio: ' + c.negocioValor + ' | Num: ' + c.numeroValor);
+      console.log('============================\n');
+      if (followupTimers.has(psid)) {
+        clearTimeout(followupTimers.get(psid));
+        followupTimers.delete(psid);
+      }
+      const conv = conversations.get(psid) || [];
+      await notifyOwner(psid, conv);
+      completedChats.add(psid);
+      conversations.delete(psid);
+      clientChecklist.delete(psid);
+      firstMessage.delete(psid);
+    } else if (checklistOk) {
+      console.log('Checklist completo, esperando que Samuel cierre...');
     }
-    const conv = conversations.get(psid) || [];
-    await notifyOwner(psid, conv);
-    completedChats.add(psid);
-    conversations.delete(psid);
-    clientChecklist.delete(psid);
-    firstMessage.delete(psid);
-  } else if (checklistOk) {
-    // Checklist completo pero Samuel aún no cerró — forzar notificación en el próximo mensaje
-    console.log('Checklist completo, esperando cierre de Samuel...');
-    console.log('neg=' + c.negocio + ' obj=' + c.objetivo + ' disp=' + c.disponibilidad + ' num=' + c.numero);
+  } finally {
+    processingNow.delete(psid);
   }
 }
 
-// ── WEBHOOK VERIFICATION (Meta lo requiere) ──
+// ── WEBHOOK VERIFICATION ──
 app.get('/webhook', (req, res) => {
   const mode  = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     console.log('Webhook verificado');
     res.status(200).send(challenge);
@@ -384,7 +392,7 @@ app.get('/webhook', (req, res) => {
 // ── RECIBIR MENSAJES ──
 app.post('/webhook', (req, res) => {
   const body = req.body;
-  res.sendStatus(200); // responder siempre 200 primero
+  res.sendStatus(200);
 
   if (body.object !== 'page') return;
 
@@ -392,32 +400,56 @@ app.post('/webhook', (req, res) => {
     for (const event of entry.messaging || []) {
       const psid = event.sender?.id;
       if (!psid) continue;
-
-      // Ignorar mensajes del bot mismo
       if (event.sender?.id === event.recipient?.id) continue;
+      if (!event.message) continue;
 
-      if (event.message) {
-        const text = event.message.text;
-        const attachments = event.message.attachments;
-
-        if (text) {
-          processMessage(psid, text).catch(console.error);
-        } else if (attachments) {
-          // Imagen o archivo
-          const attachment = attachments[0];
-          if (attachment.type === 'image') {
-            processMessage(psid, '(imagen enviada)').catch(console.error);
-          }
+      // Anti-duplicado: ignorar mensajes ya procesados
+      const mid = event.message.mid;
+      if (mid) {
+        if (processedMsgIds.has(mid)) {
+          console.log('Mensaje duplicado ignorado: ' + mid);
+          continue;
+        }
+        processedMsgIds.add(mid);
+        // Limpiar IDs viejos para no crecer infinito
+        if (processedMsgIds.size > 1000) {
+          const arr = [...processedMsgIds];
+          arr.slice(0, 500).forEach(id => processedMsgIds.delete(id));
         }
       }
+
+      // Ignorar echos (mensajes que el bot/página envía)
+      if (event.message.is_echo) continue;
+
+      if (pausedChats.has(psid)) {
+        console.log('Chat pausado, ignorado: ' + psid);
+        continue;
+      }
+
+      let text = event.message.text;
+      if (!text && event.message.attachments) {
+        const att = event.message.attachments[0];
+        if (att?.type === 'image') text = '(imagen enviada)';
+        else if (att?.type === 'sticker') continue; // ignorar stickers
+        else continue;
+      }
+      if (!text) continue;
+
+      // ── BUFFER: agrupar mensajes que llegan juntos ──
+      if (!messageBuffer.has(psid)) {
+        messageBuffer.set(psid, { messages: [], timer: null });
+      }
+      const buf = messageBuffer.get(psid);
+      if (buf.timer) clearTimeout(buf.timer);
+      buf.messages.push(text);
+      buf.timer = setTimeout(() => processBuffer(psid).catch(console.error), BUFFER_WAIT);
     }
   }
 });
 
-// ── HEALTH CHECK ──
 app.get('/', (req, res) => res.send('Liberty Media Messenger Bot activo'));
 
 app.listen(PORT, () => {
   console.log('Servidor en puerto ' + PORT);
-  console.log('Webhook: /webhook');
+  console.log('Webhook listo en /webhook');
 });
