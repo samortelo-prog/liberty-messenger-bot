@@ -420,8 +420,23 @@ app.post('/webhook', (req, res) => {
         }
       }
 
-      // Ignorar echos (mensajes que el bot/página envía)
-      if (event.message.is_echo) continue;
+      // Echos — mensajes que TÚ envías desde el inbox de la página
+      if (event.message.is_echo) {
+        const clientPsid = event.recipient?.id;
+        if (clientPsid && clientPsid !== OWNER_PSID) {
+          const echoText = event.message.text || '';
+          if (echoText.trim() === '+') {
+            pausedChats.delete(clientPsid);
+            console.log('Reactivado: ' + clientPsid);
+          } else {
+            if (!pausedChats.has(clientPsid)) {
+              pausedChats.add(clientPsid);
+              console.log('Pausado: ' + clientPsid);
+            }
+          }
+        }
+        continue;
+      }
 
       if (pausedChats.has(psid)) {
         console.log('Chat pausado, ignorado: ' + psid);
