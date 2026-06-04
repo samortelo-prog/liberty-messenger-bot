@@ -35,13 +35,13 @@ PERSONALIDAD:
 
 SERVICIOS:
 1. WEB INFORMATIVA — S/500 pago único. Diseño personalizado, responsive, hosting primer año gratis. Clientes contactan por WhatsApp. Entrega 3-7 días.
-2. TIENDA ONLINE — S/1,500 pago único. Carrito, Yape y tarjeta, panel de administración. Entrega 7-10 días.
+2. TIENDA ONLINE — S/1,500 pago único. Carrito, pagos seguros con tarjeta de débito o crédito, panel de administración. Entrega 7-10 días.
 
 PREGUNTAS FRECUENTES:
 - Hosting web: "El primer año está incluido gratis."
 - Hosting tienda: "El hosting es S/216/año y el dominio S/37/año."
 - Trabajos: "Claro: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/"
-- Yape: "Sí, acepta Yape, tarjetas y PayPal."
+- Pagos: "Acepta pagos seguros con tarjeta de débito o crédito."
 
 FLUJO:
 
@@ -50,7 +50,7 @@ FLUJO:
 2. OPCIONES — presenta en formato corto cuando el cliente responde:
 "Para [rubro] tenemos dos opciones:
 • Web desde S/500 — muestras [producto] y te contactan por WhatsApp
-• Tienda desde S/1,500 — vendes directo con Yape y carrito
+• Tienda desde S/1,500 — vendes directo con pagos seguros con tarjeta y carrito
 ¿Cuál te interesa?"
 
 3. SEGÚN LO QUE ELIJA:
@@ -318,6 +318,18 @@ app.post('/webhook', (req, res) => {
       const psid = event.sender?.id;
       if (!psid) continue;
       if (event.sender?.id === event.recipient?.id) continue;
+
+      // Cuando TÚ lees un mensaje del cliente → pausar automáticamente
+      // Meta envía read receipt con sender=PAGE cuando el admin lee desde el inbox
+      if (event.read && event.sender?.id !== OWNER_PSID) {
+        // El dueño leyó el chat del cliente — pausar
+        if (!pausedChats.has(psid)) {
+          pausedChats.add(psid);
+          console.log('AUTO-PAUSADO (read receipt): ' + psid);
+        }
+        continue;
+      }
+
       if (!event.message) continue;
 
       // Echos — mensajes que TÚ envías
