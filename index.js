@@ -9,11 +9,16 @@ const OWNER_PSID        = process.env.OWNER_PSID;
 const PORT              = process.env.PORT || 3000;
 const BUFFER_WAIT       = 7000;
 const FOLLOWUP_DELAY    = 24 * 60 * 60 * 1000;
+const FOLLOWUP_15MIN    = 15 * 60 * 1000;
+const FOLLOWUP_1HR      = 60 * 60 * 1000;
 
 const conversations   = new Map();
 const clientChecklist = new Map();
 const firstMessage    = new Set();
 const followupTimers  = new Map();
+const followup15Timers = new Map();
+const followup1hrTimers = new Map();
+const awaitingReply    = new Map(); // psid -> last bot reply timestamp
 const pausedChats     = new Set();
 const completedChats  = new Set();
 const messageBuffer   = new Map();
@@ -21,57 +26,45 @@ const processedMsgIds = new Set();
 const processingNow   = new Set();
 
 // ── SYSTEM PROMPT ──
-const SYSTEM_PROMPT = `Eres Samuel, asesor de Liberty Media, una agencia digital peruana.
+const SYSTEM_PROMPT = `Eres Samuel, asesor de Liberty Media, una agencia digital peruana que crea páginas web y tiendas online profesionales.
 
-ROL: El cliente viene de un anuncio de Facebook. Entiende qué necesita, presenta la opción correcta y agenda una llamada para HOY.
+OBJETIVO ÚNICO: Conseguir el número de teléfono del cliente para llamarle. Nada más.
 
 PERSONALIDAD:
-- Directo, cálido, breve — como un mensaje de WhatsApp real
-- MÁXIMO 2 oraciones o 3 viñetas con • por mensaje
-- NUNCA bloques largos de texto
-- Sin asteriscos ni markdown
-- NUNCA mandes dos mensajes seguidos — todo en uno
-- Un emoji cuando sea natural
-
-SERVICIOS:
-1. WEB INFORMATIVA — S/500 pago único. Diseño personalizado, responsive, hosting primer año gratis. Clientes contactan por WhatsApp. Entrega 3-7 días.
-2. TIENDA ONLINE — S/1,500 pago único. Carrito, pagos seguros con tarjeta de débito o crédito, panel de administración. Entrega 7-10 días.
-
-PREGUNTAS FRECUENTES:
-- Hosting web: "El primer año está incluido gratis."
-- Hosting tienda: "El hosting es S/216/año y el dominio S/37/año."
-- Trabajos: "Claro: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/"
-- Pagos: "Acepta pagos seguros con tarjeta de débito o crédito."
+- Mensajes muy cortos — máximo 2 oraciones
+- Sin preguntas innecesarias
+- Natural, como un mensaje de WhatsApp
+- Un emoji si es natural
+- NUNCA menciones precios a menos que el cliente pregunte directamente
 
 FLUJO:
 
-1. BIENVENIDA: "Hola, soy Samuel de Liberty Media. ¿A qué se dedica tu negocio?"
+1. PRIMER MENSAJE — saluda y pide la llamada directo:
+"Hola [nombre si lo tienes], soy Samuel de Liberty Media 👋 Creamos páginas web y tiendas online para negocios. ¿A qué número te llamamos para contarte más?"
 
-2. OPCIONES — presenta en formato corto cuando el cliente responde:
-"Para [rubro] tenemos dos opciones:
-• Web desde S/500 — muestras [producto] y te contactan por WhatsApp
-• Tienda desde S/1,500 — vendes directo con pagos seguros con tarjeta y carrito
-¿Cuál te interesa?"
+2. SI EL CLIENTE PREGUNTA EL PRECIO:
+- Web: "Desde S/500, pago único y sin mensualidades."
+- Tienda: "Desde S/1,500, con carrito de compras y pagos seguros con tarjeta."
+Luego vuelve a pedir el número: "¿A qué número te llamamos?"
 
-3. SEGÚN LO QUE ELIJA:
-- Web: "¿Tienes logo y colores de tu marca?"
-- Tienda: "¿Cuántos productos tienes para empezar?"
+3. SI EL CLIENTE PIDE PORTAFOLIO O REFERENCIAS:
+"Claro, estos son algunos trabajos: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/ ¿A qué número te llamamos?"
 
-4. AGENDA HOY: "¿Tienes 10 minutos ahora para una llamada rápida?"
-Si es de noche: "¿Mañana a las 10am te viene bien?"
+4. SI EL CLIENTE DA EL NÚMERO:
+"Perfecto, te llamamos en los próximos minutos."
+— DESPUÉS DE ESTO NO RESPONDAS MÁS MENSAJES EN ESTE CHAT —
 
-5. NÚMERO: "¿A qué número de WhatsApp o teléfono te llamamos?"
-SIEMPRE pide dígitos reales. Si dice "este número" responde: "¿Cuál es tu número exacto?"
-
-6. CIERRE: "Perfecto [nombre], te llamamos [hora]. Cualquier duda me escribes."
+5. SI EL CLIENTE DICE QUE NO PUEDE AHORA:
+"¿A qué hora te viene bien hoy? Te llamamos cuando digas."
+Cuando confirme hora: "Perfecto, te llamamos a las [hora]."
+— DESPUÉS DE ESTO NO RESPONDAS MÁS MENSAJES EN ESTE CHAT —
 
 REGLAS:
-- Máximo 2 oraciones o 3 viñetas por mensaje
-- NUNCA cierres sin número con dígitos reales
-- NUNCA menciones pagos ni adelantos
-- Si manda sticker: ignóralo
-- Nunca menciones inteligencia artificial
-- Llamada HOY si es posible`;
+- NUNCA hagas preguntas sobre el negocio, rubro, productos ni objetivos
+- NUNCA menciones precios si no te preguntan
+- NUNCA envíes mensajes largos ni listas
+- NUNCA menciones inteligencia artificial
+- Cuando tengas número o hora confirmada: responde una última vez y CIERRA el chat`;
 
 // ── CHECKLIST ──
 function getChecklist(psid) {
@@ -226,6 +219,59 @@ async function notifyOwner(psid, conv) {
   console.log('Lead enviado — ' + now);
 }
 
+// ── FOLLOW-UP 15 MIN ──
+function schedule15Min(psid) {
+  // Cancelar si ya hay uno activo
+  if (followup15Timers.has(psid)) clearTimeout(followup15Timers.get(psid));
+  if (followup1hrTimers.has(psid)) clearTimeout(followup1hrTimers.get(psid));
+
+  const t15 = setTimeout(async () => {
+    followup15Timers.delete(psid);
+    if (pausedChats.has(psid) || completedChats.has(psid)) return;
+    // Solo si el cliente no ha respondido desde el último mensaje del bot
+    const lastReply = awaitingReply.get(psid);
+    if (!lastReply) return;
+    if (Date.now() - lastReply < FOLLOWUP_15MIN - 5000) return;
+
+    console.log('FOLLOWUP 15min → ' + psid);
+    await sendMessage(psid,
+      '¿Sigues por ahí? Te llamo ahora mismo si tienes 5 minutos.'
+    );
+    awaitingReply.set(psid, Date.now());
+
+    // Programar el de 1 hora desde ahora
+    schedule1hr(psid);
+  }, FOLLOWUP_15MIN);
+
+  followup15Timers.set(psid, t15);
+}
+
+function schedule1hr(psid) {
+  if (followup1hrTimers.has(psid)) clearTimeout(followup1hrTimers.get(psid));
+
+  const t1hr = setTimeout(async () => {
+    followup1hrTimers.delete(psid);
+    if (pausedChats.has(psid) || completedChats.has(psid)) return;
+    const lastReply = awaitingReply.get(psid);
+    if (!lastReply) return;
+    if (Date.now() - lastReply < FOLLOWUP_1HR - 5000) return;
+
+    console.log('FOLLOWUP 1hr → ' + psid);
+    await sendMessage(psid,
+      'Quedamos pendientes. ¿Cuándo te viene bien que te llamemos hoy?'
+    );
+    awaitingReply.set(psid, null);
+  }, FOLLOWUP_1HR);
+
+  followup1hrTimers.set(psid, t1hr);
+}
+
+function cancelFollowups(psid) {
+  if (followup15Timers.has(psid)) { clearTimeout(followup15Timers.get(psid)); followup15Timers.delete(psid); }
+  if (followup1hrTimers.has(psid)) { clearTimeout(followup1hrTimers.get(psid)); followup1hrTimers.delete(psid); }
+  awaitingReply.set(psid, null);
+}
+
 // ── SEGUIMIENTO 24H ──
 function scheduleFollowup(psid) {
   if (followupTimers.has(psid)) clearTimeout(followupTimers.get(psid));
@@ -233,7 +279,7 @@ function scheduleFollowup(psid) {
     if (pausedChats.has(psid) || completedChats.has(psid)) return;
     const conv = conversations.get(psid) || [];
     if (conv.length === 0) return;
-    await sendMessage(psid, 'Hola, soy Samuel de Liberty Media. ¿Sigues interesado en la web para tu negocio? Estamos disponibles esta semana.');
+    await sendMessage(psid, 'Hola, quedó pendiente tu web. Esta semana tenemos espacio disponible si quieres arrancar. ¿Te llamamos hoy?');
     followupTimers.delete(psid);
   }, FOLLOWUP_DELAY);
   followupTimers.set(psid, timer);
@@ -251,6 +297,9 @@ async function processBuffer(psid) {
   try {
     const combinedText = buf.messages.join('. ');
     console.log('\nMensaje de ' + psid + ': ' + combinedText.substring(0, 100));
+
+    // Cliente respondió — cancelar follow-ups pendientes
+    cancelFollowups(psid);
 
     // Post-cierre
     if (completedChats.has(psid)) {
@@ -274,6 +323,10 @@ async function processBuffer(psid) {
 
     await sendMessage(psid, reply);
     console.log('Samuel: ' + reply.substring(0, 100));
+
+    // Marcar que esperamos respuesta del cliente y activar follow-ups
+    awaitingReply.set(psid, Date.now());
+    schedule15Min(psid);
 
     scheduleFollowup(psid);
 
@@ -358,6 +411,11 @@ app.post('/webhook', (req, res) => {
         if (processedMsgIds.size > 1000) {
           const arr = [...processedMsgIds];
           arr.slice(0, 500).forEach(id => processedMsgIds.delete(id));
+        }
+        // Limpiar completedChats para evitar memory leak
+        if (completedChats.size > 500) {
+          const arr = [...completedChats];
+          arr.slice(0, 250).forEach(id => completedChats.delete(id));
         }
       }
 
