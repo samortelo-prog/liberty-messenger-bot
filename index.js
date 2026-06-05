@@ -8,16 +8,17 @@ const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
 const OWNER_PSID        = process.env.OWNER_PSID;
 const PORT              = process.env.PORT || 3000;
 const BUFFER_WAIT       = 7000;
-const FOLLOWUP_DELAY    = 24 * 60 * 60 * 1000;
+const FOLLOWUP_DELAY    = 2 * 60 * 60 * 1000;
 const FOLLOWUP_15MIN    = 15 * 60 * 1000;
-const FOLLOWUP_1HR      = 60 * 60 * 1000;
+const FOLLOWUP_30MIN = 30 * 60 * 1000;
+const FOLLOWUP_2HR   = 2 * 60 * 60 * 1000;
 
 const conversations   = new Map();
 const clientChecklist = new Map();
 const firstMessage    = new Set();
 const followupTimers  = new Map();
 const followup15Timers = new Map();
-const followup1hrTimers = new Map();
+const followup30Timers = new Map();
 const awaitingReply    = new Map(); // psid -> last bot reply timestamp
 const pausedChats     = new Set();
 const completedChats  = new Set();
@@ -26,45 +27,48 @@ const processedMsgIds = new Set();
 const processingNow   = new Set();
 
 // ── SYSTEM PROMPT ──
-const SYSTEM_PROMPT = `Eres Samuel, asesor de Liberty Media, una agencia digital peruana que crea páginas web y tiendas online profesionales.
+const SYSTEM_PROMPT = `Eres Samuel, asesor de Liberty Media, una agencia digital peruana.
 
-OBJETIVO ÚNICO: Conseguir el número de teléfono del cliente para llamarle. Nada más.
+OBJETIVO: Conseguir el número del cliente para llamarle.
 
 PERSONALIDAD:
-- Mensajes muy cortos — máximo 2 oraciones
-- Sin preguntas innecesarias
-- Natural, como un mensaje de WhatsApp
+- Mensajes cortos — máximo 2 oraciones
+- Natural, como WhatsApp
 - Un emoji si es natural
-- NUNCA menciones precios a menos que el cliente pregunte directamente
+- NUNCA repitas la misma pregunta dos veces seguidas
 
 FLUJO:
 
-1. PRIMER MENSAJE — saluda y pide la llamada directo:
-"Hola [nombre si lo tienes], soy Samuel de Liberty Media 👋 Creamos páginas web y tiendas online para negocios. ¿A qué número te llamamos para contarte más?"
+1. PRIMER MENSAJE — presenta los servicios y pregunta si puede conversar:
+"Hola, soy Samuel de Liberty Media. Hacemos webs para negocios desde S/500 — páginas informativas, catálogos, landing pages y más — con contacto directo por WhatsApp, o tienda completa desde S/1,500 con pagos con tarjeta. ¿Tienes unos minutos para conversar?"
 
-2. SI EL CLIENTE PREGUNTA EL PRECIO:
-- Web: "Desde S/500, pago único y sin mensualidades."
-- Tienda: "Desde S/1,500, con carrito de compras y pagos seguros con tarjeta."
-Luego vuelve a pedir el número: "¿A qué número te llamamos?"
+2. SI EL CLIENTE DICE QUE SÍ O MUESTRA INTERÉS:
+"¿A qué número te llamamos?"
 
-3. SI EL CLIENTE PIDE PORTAFOLIO O REFERENCIAS:
-"Claro, estos son algunos trabajos: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/ ¿A qué número te llamamos?"
+3. SI EL CLIENTE PIDE MÁS INFO antes de dar el número:
+Responde brevemente en una oración y ofrece la llamada: "¿Te llamamos para contarte más?"
 
-4. SI EL CLIENTE DA EL NÚMERO:
+4. SI EL CLIENTE PIDE PORTAFOLIO:
+"Claro: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/"
+— No pidas el número inmediatamente, deja que el cliente responda —
+
+5. SI EL CLIENTE PREGUNTA PRECIO:
+- Web: "Desde S/500, pago único sin mensualidades."
+- Tienda: "Desde S/1,500, con carrito y pagos seguros con tarjeta."
+
+6. CUANDO EL CLIENTE DÉ EL NÚMERO:
 "Perfecto, te llamamos en los próximos minutos."
-— DESPUÉS DE ESTO NO RESPONDAS MÁS MENSAJES EN ESTE CHAT —
+— CIERRA EL CHAT, NO RESPONDAS MÁS —
 
-5. SI EL CLIENTE DICE QUE NO PUEDE AHORA:
-"¿A qué hora te viene bien hoy? Te llamamos cuando digas."
-Cuando confirme hora: "Perfecto, te llamamos a las [hora]."
-— DESPUÉS DE ESTO NO RESPONDAS MÁS MENSAJES EN ESTE CHAT —
+7. SI EL CLIENTE NO PUEDE AHORA:
+"¿A qué hora te viene bien hoy?"
+Cuando confirme: "Perfecto, te llamamos a las [hora]."
+— CIERRA EL CHAT, NO RESPONDAS MÁS —
 
 REGLAS:
-- NUNCA hagas preguntas sobre el negocio, rubro, productos ni objetivos
-- NUNCA menciones precios si no te preguntan
-- NUNCA envíes mensajes largos ni listas
+- NUNCA repitas "¿A qué número te llamamos?" más de una vez
 - NUNCA menciones inteligencia artificial
-- Cuando tengas número o hora confirmada: responde una última vez y CIERRA el chat`;
+- Mensajes cortos siempre`;
 
 // ── CHECKLIST ──
 function getChecklist(psid) {
@@ -223,7 +227,7 @@ async function notifyOwner(psid, conv) {
 function schedule15Min(psid) {
   // Cancelar si ya hay uno activo
   if (followup15Timers.has(psid)) clearTimeout(followup15Timers.get(psid));
-  if (followup1hrTimers.has(psid)) clearTimeout(followup1hrTimers.get(psid));
+  if (followup30Timers.has(psid)) clearTimeout(followup30Timers.get(psid));
 
   const t15 = setTimeout(async () => {
     followup15Timers.delete(psid);
@@ -234,9 +238,13 @@ function schedule15Min(psid) {
     if (Date.now() - lastReply < FOLLOWUP_15MIN - 5000) return;
 
     console.log('FOLLOWUP 15min → ' + psid);
-    await sendMessage(psid,
-      '¿Sigues por ahí? Te llamo ahora mismo si tienes 5 minutos.'
-    );
+    // Solo enviar portafolio si no fue enviado antes en la conversación
+    const conv15 = conversations.get(psid) || [];
+    const convText15 = conv15.map(m => m.content).join(' ').toLowerCase();
+    const portfolioAlreadySent = convText15.includes('vitain.pe') || convText15.includes('sanguchoncampesino');
+    if (!portfolioAlreadySent) {
+      await sendMessage(psid, 'Por si quieres ver algunos de nuestros trabajos: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/');
+    }
     awaitingReply.set(psid, Date.now());
 
     // Programar el de 1 hora desde ahora
@@ -247,28 +255,28 @@ function schedule15Min(psid) {
 }
 
 function schedule1hr(psid) {
-  if (followup1hrTimers.has(psid)) clearTimeout(followup1hrTimers.get(psid));
+  if (followup30Timers.has(psid)) clearTimeout(followup30Timers.get(psid));
 
   const t1hr = setTimeout(async () => {
-    followup1hrTimers.delete(psid);
+    followup30Timers.delete(psid);
     if (pausedChats.has(psid) || completedChats.has(psid)) return;
     const lastReply = awaitingReply.get(psid);
     if (!lastReply) return;
-    if (Date.now() - lastReply < FOLLOWUP_1HR - 5000) return;
+    if (Date.now() - lastReply < FOLLOWUP_30MIN - 5000) return;
 
     console.log('FOLLOWUP 1hr → ' + psid);
     await sendMessage(psid,
-      'Quedamos pendientes. ¿Cuándo te viene bien que te llamemos hoy?'
+      '¿Sigues por ahí? Te llamo ahora mismo si tienes 5 minutos.'
     );
     awaitingReply.set(psid, null);
-  }, FOLLOWUP_1HR);
+  }, FOLLOWUP_30MIN);
 
-  followup1hrTimers.set(psid, t1hr);
+  followup30Timers.set(psid, t1hr);
 }
 
 function cancelFollowups(psid) {
   if (followup15Timers.has(psid)) { clearTimeout(followup15Timers.get(psid)); followup15Timers.delete(psid); }
-  if (followup1hrTimers.has(psid)) { clearTimeout(followup1hrTimers.get(psid)); followup1hrTimers.delete(psid); }
+  if (followup30Timers.has(psid)) { clearTimeout(followup30Timers.get(psid)); followup30Timers.delete(psid); }
   awaitingReply.set(psid, null);
 }
 
