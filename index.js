@@ -8,10 +8,10 @@ const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
 const OWNER_PSID        = process.env.OWNER_PSID;
 const PORT              = process.env.PORT || 3000;
 const BUFFER_WAIT       = 7000;
-const FOLLOWUP_DELAY    = 2 * 60 * 60 * 1000;
+const FOLLOWUP_DELAY    = 1.5 * 60 * 60 * 1000;
 const FOLLOWUP_15MIN    = 15 * 60 * 1000;
 const FOLLOWUP_30MIN = 30 * 60 * 1000;
-const FOLLOWUP_2HR   = 2 * 60 * 60 * 1000;
+const FOLLOWUP_2HR   = 1.5 * 60 * 60 * 1000;
 
 const conversations   = new Map();
 const clientChecklist = new Map();
