@@ -332,29 +332,43 @@ async function processBuffer(psid) {
     await sendMessage(psid, reply);
     console.log('Samuel: ' + reply.substring(0, 100));
 
-    // Marcar que esperamos respuesta del cliente y activar follow-ups
-    awaitingReply.set(psid, Date.now());
-    schedule15Min(psid);
-
-    scheduleFollowup(psid);
-
-    // Verificar cierre
+    // ── VERIFICAR CIERRE ANTES de activar follow-ups ──
     const c = getChecklist(psid);
     const rl = reply.toLowerCase();
-    const checklistOk = c.negocio && c.objetivo && c.disponibilidad && c.numero;
+
+    // Escenario 1: cliente dio número y Samuel confirmó llamada
+    const checklistConNumero = c.negocio && c.objetivo && c.disponibilidad && c.numero;
+    // Escenario 2: Samuel confirmó hora de llamada (con o sin número)
+    const confirmoHora =
+      rl.includes('te llamamos a las') ||
+      rl.includes('te llamamos mañana') ||
+      rl.includes('agendado') ||
+      (rl.includes('perfecto') && rl.includes('a las')) ||
+      (rl.includes('perfecto') && rl.includes('te llamamos'));
+
     const samuelCerro = rl.includes('te llamamos') || rl.includes('nuestro equipo') ||
       rl.includes('ya tengo todo') || rl.includes('en las próximas') ||
       (rl.includes('perfecto') && (rl.includes('coordinar') || rl.includes('llamar')));
 
-    if (checklistOk && samuelCerro) {
+    const esCierre = (checklistConNumero && samuelCerro) || confirmoHora;
+
+    if (esCierre) {
+      // Cierre confirmado — no activar ningun follow-up, notificar y cerrar
       console.log('CIERRE — ' + psid + ' num=' + c.numeroValor);
+      cancelFollowups(psid);
       if (followupTimers.has(psid)) { clearTimeout(followupTimers.get(psid)); followupTimers.delete(psid); }
+      awaitingReply.set(psid, null);
       const conv = conversations.get(psid) || [];
       await notifyOwner(psid, conv);
       completedChats.add(psid);
       conversations.delete(psid);
       clientChecklist.delete(psid);
       firstMessage.delete(psid);
+    } else {
+      // No es cierre — activar follow-ups normalmente
+      awaitingReply.set(psid, Date.now());
+      schedule15Min(psid);
+      scheduleFollowup(psid);
     }
   } finally {
     processingNow.delete(psid);
