@@ -8,10 +8,10 @@ const VERIFY_TOKEN      = process.env.VERIFY_TOKEN;
 const OWNER_PSID        = process.env.OWNER_PSID;
 const PORT              = process.env.PORT || 3000;
 const BUFFER_WAIT       = 7000;
-const FOLLOWUP_DELAY    = 1.5 * 60 * 60 * 1000;
+const FOLLOWUP_DELAY    = 2 * 60 * 60 * 1000;
 const FOLLOWUP_15MIN    = 15 * 60 * 1000;
 const FOLLOWUP_30MIN = 30 * 60 * 1000;
-const FOLLOWUP_2HR   = 1.5 * 60 * 60 * 1000;
+const FOLLOWUP_2HR   = 2 * 60 * 60 * 1000;
 
 const conversations   = new Map();
 const clientChecklist = new Map();
@@ -40,7 +40,7 @@ PERSONALIDAD:
 FLUJO:
 
 1. PRIMER MENSAJE — presenta los servicios y pregunta si puede conversar:
-"Hola, soy Samuel de Liberty Media. Hacemos webs para negocios desde S/500 — páginas informativas, catálogos, landing pages y más — con contacto directo por WhatsApp, o tienda completa desde S/1,500 con pagos con tarjeta. ¿Tienes unos minutos para conversar?"
+"Hola, soy Samuel de Liberty Media. Hacemos webs para negocios desde S/750 — páginas informativas, catálogos, landing pages y más — con contacto directo por WhatsApp, o tienda completa desde S/1,400 con pagos con tarjeta. ¿Tienes unos minutos para conversar?"
 
 2. SI EL CLIENTE DICE QUE SÍ O MUESTRA INTERÉS:
 "¿A qué número te llamamos?"
@@ -49,12 +49,12 @@ FLUJO:
 Responde brevemente en una oración y ofrece la llamada: "¿Te llamamos para contarte más?"
 
 4. SI EL CLIENTE PIDE PORTAFOLIO:
-"Claro: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/"
+"Claro: https://libertymediastudio.com — y algunos clientes: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/"
 — No pidas el número inmediatamente, deja que el cliente responda —
 
 5. SI EL CLIENTE PREGUNTA PRECIO:
-- Web: "Desde S/500, pago único sin mensualidades."
-- Tienda: "Desde S/1,500, con carrito y pagos seguros con tarjeta."
+- Web: "Desde S/750, pago único sin mensualidades."
+- Tienda: "Desde S/1,400, con carrito y pagos seguros con tarjeta."
 
 6. CUANDO EL CLIENTE DÉ EL NÚMERO:
 "Perfecto, te llamamos en los próximos minutos."
@@ -241,9 +241,9 @@ function schedule15Min(psid) {
     // Solo enviar portafolio si no fue enviado antes en la conversación
     const conv15 = conversations.get(psid) || [];
     const convText15 = conv15.map(m => m.content).join(' ').toLowerCase();
-    const portfolioAlreadySent = convText15.includes('vitain.pe') || convText15.includes('sanguchoncampesino');
+    const portfolioAlreadySent = convText15.includes('libertymediastudio.com') || convText15.includes('vitain.pe') || convText15.includes('sanguchoncampesino');
     if (!portfolioAlreadySent) {
-      await sendMessage(psid, 'Por si quieres ver algunos de nuestros trabajos: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/');
+      await sendMessage(psid, 'Por si quieres ver nuestros trabajos: https://libertymediastudio.com — y algunos clientes: https://vitain.pe/ — https://sanguchoncampesino.pe/ — https://lisoft.edu.pe/');
     }
     awaitingReply.set(psid, Date.now());
 
@@ -332,43 +332,29 @@ async function processBuffer(psid) {
     await sendMessage(psid, reply);
     console.log('Samuel: ' + reply.substring(0, 100));
 
-    // ── VERIFICAR CIERRE ANTES de activar follow-ups ──
+    // Marcar que esperamos respuesta del cliente y activar follow-ups
+    awaitingReply.set(psid, Date.now());
+    schedule15Min(psid);
+
+    scheduleFollowup(psid);
+
+    // Verificar cierre
     const c = getChecklist(psid);
     const rl = reply.toLowerCase();
-
-    // Escenario 1: cliente dio número y Samuel confirmó llamada
-    const checklistConNumero = c.negocio && c.objetivo && c.disponibilidad && c.numero;
-    // Escenario 2: Samuel confirmó hora de llamada (con o sin número)
-    const confirmoHora =
-      rl.includes('te llamamos a las') ||
-      rl.includes('te llamamos mañana') ||
-      rl.includes('agendado') ||
-      (rl.includes('perfecto') && rl.includes('a las')) ||
-      (rl.includes('perfecto') && rl.includes('te llamamos'));
-
+    const checklistOk = c.negocio && c.objetivo && c.disponibilidad && c.numero;
     const samuelCerro = rl.includes('te llamamos') || rl.includes('nuestro equipo') ||
       rl.includes('ya tengo todo') || rl.includes('en las próximas') ||
       (rl.includes('perfecto') && (rl.includes('coordinar') || rl.includes('llamar')));
 
-    const esCierre = (checklistConNumero && samuelCerro) || confirmoHora;
-
-    if (esCierre) {
-      // Cierre confirmado — no activar ningun follow-up, notificar y cerrar
+    if (checklistOk && samuelCerro) {
       console.log('CIERRE — ' + psid + ' num=' + c.numeroValor);
-      cancelFollowups(psid);
       if (followupTimers.has(psid)) { clearTimeout(followupTimers.get(psid)); followupTimers.delete(psid); }
-      awaitingReply.set(psid, null);
       const conv = conversations.get(psid) || [];
       await notifyOwner(psid, conv);
       completedChats.add(psid);
       conversations.delete(psid);
       clientChecklist.delete(psid);
       firstMessage.delete(psid);
-    } else {
-      // No es cierre — activar follow-ups normalmente
-      awaitingReply.set(psid, Date.now());
-      schedule15Min(psid);
-      scheduleFollowup(psid);
     }
   } finally {
     processingNow.delete(psid);
